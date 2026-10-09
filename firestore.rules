@@ -1,0 +1,14 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Cada progreso se lee/escribe solo conociendo su código exacto.
+    // No se puede listar la colección ni borrar documentos.
+    match /progreso/{codigo} {
+      allow get: if codigo.matches('^[a-z0-9]{5}-[a-z0-9]{5}$');
+      allow create, update: if codigo.matches('^[a-z0-9]{5}-[a-z0-9]{5}$')
+        && request.resource.data.keys().hasOnly(['estado', 't'])
+        && request.resource.data.estado is map;
+      allow list, delete: if false;
+    }
+  }
+}

@@ -136,6 +136,21 @@
   .ok { color: var(--green); }
   .no { color: #c0392b; }
 
+  .sync {
+    display: none; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
+    margin-top: 16px; padding: 12px 16px; border-radius: 12px; background: var(--card);
+    border: 1px solid var(--line); font-size: 14px;
+  }
+  .sync.on { display: flex; }
+  .sync .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #bbb; margin-right: 8px; vertical-align: middle; }
+  .sync .dot.ok { background: var(--green); }
+  .sync .dot.err { background: #c0392b; }
+  .sync code { background: var(--lila); color: var(--purple); padding: 2px 8px; border-radius: 6px; font-weight: 600; }
+  .sync .acts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .sync .acts button {
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink); padding: 6px 12px; border-radius: 99px; font-size: 13px;
+  }
+
   .reset { border: none; background: none; color: var(--muted); text-decoration: underline; font-size: 13px; padding: 0; }
 
   .toast {
@@ -185,6 +200,14 @@
     <div class="levels" id="levels"></div>
   </section>
 
+  <div class="sync" id="sync">
+    <div><span class="dot" id="syncDot"></span><span id="syncTxt">Conectando…</span></div>
+    <div class="acts">
+      <button id="syncLink">Copiar link para otro dispositivo</button>
+      <button id="syncOtro">Usar otro código</button>
+    </div>
+  </div>
+
   <div class="toolbar">
     <div class="filters" id="filters">
       <button data-f="all" class="on">Todas</button>
@@ -206,6 +229,10 @@
 <div class="toast" id="toast"></div>
 
 <script>
+/* Config de Firebase (Consola > Configuración del proyecto > Tus apps > Web).
+   Mientras esté en null la página funciona igual, guardando solo en este dispositivo. */
+const FIREBASE_CONFIG = null;
+
 /* Plan de correlativas. c = para cursar necesita CURSADA, a = necesita APROBADA */
 const PLAN = [
   { nivel: 1, materias: [
@@ -270,7 +297,10 @@ const KEY = "carrera-iq-v1";
 /* estado: { id: { s: 0|1|2, nota: "" } } */
 let state = {};
 try { state = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { state = {}; }
-const save = () => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} };
+const save = () => {
+  try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+  Sync.push();
+};
 const st = id => (state[id] && state[id].s) || 0;
 
 let filter = "all";
@@ -404,7 +434,105 @@ document.getElementById("reset").addEventListener("click", () => {
   render();
 });
 
+/* ---------- Sincronización (Firestore) ----------
+   Cada progreso vive en progreso/{código}. El código es aleatorio y funciona como llave:
+   quien lo tenga puede ver y editar ese progreso. */
+const Sync = {
+  ref: null, setDoc: null, codigo: null, timer: null,
+  CODE_KEY: "carrera-iq-sync",
+
+  nuevoCodigo() {
+    const abc = "abcdefghjkmnpqrstuvwxyz23456789";
+    const r = crypto.getRandomValues(new Uint8Array(10));
+    const s = [...r].map(n => abc[n % abc.length]).join("");
+    return s.slice(0, 5) + "-" + s.slice(5);
+  },
+
+  estado(txt, tipo) {
+    document.getElementById("syncTxt").innerHTML = txt;
+    document.getElementById("syncDot").className = "dot " + (tipo || "");
+  },
+
+  push() {
+    if (!this.ref) return;
+    clearTimeout(this.timer);
+    // pequeña espera para no escribir en cada tecla de la nota
+    this.timer = setTimeout(() => {
+      this.setDoc(this.ref, { estado: state, t: Date.now() })
+        .then(() => this.estado(`Sincronizado · código <code>${this.codigo}</code>`, "ok"))
+        .catch(() => this.estado("No se pudo sincronizar (se guardó en este dispositivo)", "err"));
+    }, 400);
+  },
+
+  async init() {
+    if (!FIREBASE_CONFIG) return;
+    document.getElementById("sync").classList.add("on");
+
+    // ?sync=CODIGO en la URL conecta este dispositivo a ese progreso
+    const url = new URL(location.href);
+    const desdeLink = url.searchParams.get("sync");
+    if (desdeLink) {
+      url.searchParams.delete("sync");
+      history.replaceState(null, "", url);
+    }
+    let codigo = desdeLink;
+    try { codigo = codigo || localStorage.getItem(this.CODE_KEY); } catch (e) {}
+    codigo = codigo || this.nuevoCodigo();
+    try { localStorage.setItem(this.CODE_KEY, codigo); } catch (e) {}
+    this.codigo = codigo;
+
+    try {
+      const V = "10.12.2";
+      const { initializeApp } = await import(`https://www.gstatic.com/firebasejs/${V}/firebase-app.js`);
+      const fs = await import(`https://www.gstatic.com/firebasejs/${V}/firebase-firestore.js`);
+      const db = fs.getFirestore(initializeApp(FIREBASE_CONFIG));
+      const ref = fs.doc(db, "progreso", codigo);
+      this.setDoc = fs.setDoc;
+
+      const snap = await fs.getDoc(ref);
+      this.ref = ref;
+      if (snap.exists()) {
+        state = snap.data().estado || {};
+        try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+        render();
+      } else {
+        this.push(); // primera vez: sube lo que haya en este dispositivo
+      }
+      this.estado(`Sincronizado · código <code>${codigo}</code>`, "ok");
+
+      // cambios hechos desde otro dispositivo
+      fs.onSnapshot(ref, s => {
+        if (s.metadata.hasPendingWrites || !s.exists()) return;
+        const remoto = s.data().estado || {};
+        if (JSON.stringify(remoto) === JSON.stringify(state)) return;
+        if (document.activeElement && document.activeElement.matches(".nota input")) return;
+        state = remoto;
+        try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+        render();
+      });
+    } catch (e) {
+      this.ref = null;
+      this.estado("Sin conexión: se guarda en este dispositivo", "err");
+    }
+  },
+};
+
+document.getElementById("syncLink").addEventListener("click", async () => {
+  const link = `${location.origin}${location.pathname}?sync=${Sync.codigo}`;
+  try { await navigator.clipboard.writeText(link); toast("Link copiado. Abrilo en el otro dispositivo"); }
+  catch (e) { prompt("Copiá este link y abrilo en el otro dispositivo:", link); }
+});
+
+document.getElementById("syncOtro").addEventListener("click", () => {
+  const c = (prompt("Pegá el código del otro dispositivo (ej: abcde-23456):") || "").trim().toLowerCase();
+  if (!/^[a-z0-9]{5}-[a-z0-9]{5}$/.test(c)) { if (c) toast("Ese código no tiene el formato correcto"); return; }
+  if (!confirm("Se va a reemplazar el progreso de este dispositivo por el de ese código. ¿Seguir?")) return;
+  try { localStorage.setItem(Sync.CODE_KEY, c); } catch (e) {}
+  location.reload();
+});
+
 render();
+Sync.init();
 </script>
 </body>
 </html>
