@@ -305,7 +305,10 @@ const KEY = "carrera-iq-v1";
 let state = {};
 try { state = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { state = {}; }
 const save = () => {
-  try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
+  try {
+    localStorage.setItem(KEY, JSON.stringify(state));
+    localStorage.setItem(Sync.PEND_KEY, "1"); // hay cambios que todavía no llegaron a la nube
+  } catch (e) {}
   Sync.push();
 };
 const st = id => (state[id] && state[id].s) || 0;
@@ -435,7 +438,9 @@ document.getElementById("filters").addEventListener("click", e => {
 });
 
 document.getElementById("reset").addEventListener("click", () => {
-  if (!confirm("¿Borrar todo el progreso guardado?")) return;
+  if (!confirm(Sync.ref
+    ? "¿Borrar todo el progreso? Se borra también en tus otros dispositivos."
+    : "¿Borrar todo el progreso guardado?")) return;
   state = {};
   save();
   render();
@@ -447,6 +452,8 @@ document.getElementById("reset").addEventListener("click", () => {
 const Sync = {
   ref: null, setDoc: null, codigo: null, timer: null,
   CODE_KEY: "carrera-iq-sync",
+  PEND_KEY: "carrera-iq-pend",
+  RE: /^[a-z0-9]{5}-[a-z0-9]{5}$/,
 
   nuevoCodigo() {
     const abc = "abcdefghjkmnpqrstuvwxyz23456789";
@@ -465,8 +472,13 @@ const Sync = {
     clearTimeout(this.timer);
     // pequeña espera para no escribir en cada tecla de la nota
     this.timer = setTimeout(() => {
+      const enviado = JSON.stringify(state);
       this.setDoc(this.ref, { estado: state, t: Date.now() })
-        .then(() => this.estado(`Sincronizado · código <code>${this.codigo}</code>`, "ok"))
+        .then(() => {
+          // si mientras tanto cambió algo, queda pendiente para el próximo envío
+          if (JSON.stringify(state) === enviado) { try { localStorage.removeItem(this.PEND_KEY); } catch (e) {} }
+          this.estado(`Sincronizado · código <code>${this.codigo}</code>`, "ok");
+        })
         .catch(() => this.estado("No se pudo sincronizar (se guardó en este dispositivo)", "err"));
     }, 400);
   },
@@ -475,18 +487,22 @@ const Sync = {
     if (!FIREBASE_CONFIG) return;
     document.getElementById("sync").classList.add("on");
 
-    // ?sync=CODIGO en la URL conecta este dispositivo a ese progreso
+    // ?sync=CODIGO en la URL conecta este dispositivo a ese progreso.
+    // El código queda siempre en la URL: así un favorito o acceso directo se reconecta
+    // aunque el navegador borre sus datos (Safari lo hace tras 7 días sin visitas).
     const url = new URL(location.href);
-    const desdeLink = url.searchParams.get("sync");
-    if (desdeLink) {
-      url.searchParams.delete("sync");
-      history.replaceState(null, "", url);
-    }
-    let codigo = desdeLink;
-    try { codigo = codigo || localStorage.getItem(this.CODE_KEY); } catch (e) {}
-    codigo = codigo || this.nuevoCodigo();
-    try { localStorage.setItem(this.CODE_KEY, codigo); } catch (e) {}
+    let desdeLink = (url.searchParams.get("sync") || "").trim().toLowerCase();
+    if (!this.RE.test(desdeLink)) desdeLink = "";
+    let guardado = null, pendiente = false;
+    try {
+      guardado = localStorage.getItem(this.CODE_KEY);
+      pendiente = localStorage.getItem(this.PEND_KEY) === "1";
+    } catch (e) {}
+    const codigo = desdeLink || guardado || this.nuevoCodigo();
+    const cambiaDeCodigo = !!guardado && codigo !== guardado;
     this.codigo = codigo;
+    url.searchParams.set("sync", codigo);
+    history.replaceState(null, "", url);
 
     try {
       const V = "10.12.2";
@@ -497,13 +513,34 @@ const Sync = {
       this.setDoc = fs.setDoc;
 
       const snap = await fs.getDoc(ref);
+      const remoto = snap.exists() ? (snap.data().estado || {}) : null;
+      const hayLocal = Object.keys(state).length > 0;
+      const distintos = remoto && JSON.stringify(remoto) !== JSON.stringify(state);
+
+      if (distintos && hayLocal && cambiaDeCodigo) {
+        // abrió el link de otro dispositivo donde ya tenía progreso propio
+        const ok = confirm("Este dispositivo ya tenía materias marcadas.\n\n" +
+          "Aceptar: usar el progreso del link (se reemplaza el de acá).\n" +
+          "Cancelar: seguir con el progreso de este dispositivo.");
+        if (!ok) {
+          url.searchParams.set("sync", guardado);
+          location.replace(url);
+          return;
+        }
+      }
+
+      try { localStorage.setItem(this.CODE_KEY, codigo); } catch (e) {}
       this.ref = ref;
-      if (snap.exists()) {
-        state = snap.data().estado || {};
-        try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
-        render();
+
+      if (!remoto || (distintos && pendiente && !cambiaDeCodigo)) {
+        this.push(); // primera vez, o cambios hechos sin conexión: gana este dispositivo
       } else {
-        this.push(); // primera vez: sube lo que haya en este dispositivo
+        state = remoto;
+        try {
+          localStorage.setItem(KEY, JSON.stringify(state));
+          localStorage.removeItem(this.PEND_KEY);
+        } catch (e) {}
+        render();
       }
       this.estado(`Sincronizado · código <code>${codigo}</code>`, "ok");
 
@@ -532,10 +569,10 @@ document.getElementById("syncLink").addEventListener("click", async () => {
 
 document.getElementById("syncOtro").addEventListener("click", () => {
   const c = (prompt("Pegá el código del otro dispositivo (ej: abcde-23456):") || "").trim().toLowerCase();
-  if (!/^[a-z0-9]{5}-[a-z0-9]{5}$/.test(c)) { if (c) toast("Ese código no tiene el formato correcto"); return; }
-  if (!confirm("Se va a reemplazar el progreso de este dispositivo por el de ese código. ¿Seguir?")) return;
-  try { localStorage.setItem(Sync.CODE_KEY, c); } catch (e) {}
-  location.reload();
+  if (!Sync.RE.test(c)) { if (c) toast("Ese código no tiene el formato correcto"); return; }
+  const url = new URL(location.href);
+  url.searchParams.set("sync", c);
+  location.href = url; // al cargar pregunta si hay que reemplazar el progreso de acá
 });
 
 render();
