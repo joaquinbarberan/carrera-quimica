@@ -547,6 +547,8 @@ const Sync = {
       // cambios hechos desde otro dispositivo
       fs.onSnapshot(ref, s => {
         if (s.metadata.hasPendingWrites || !s.exists()) return;
+        // si acá hay cambios que todavía no subieron, no se pisan con los de la nube
+        try { if (localStorage.getItem(Sync.PEND_KEY) === "1") return; } catch (e) {}
         const remoto = s.data().estado || {};
         if (JSON.stringify(remoto) === JSON.stringify(state)) return;
         if (document.activeElement && document.activeElement.matches(".nota input")) return;
